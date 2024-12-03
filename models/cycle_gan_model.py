@@ -3,6 +3,7 @@ import itertools
 from util.image_pool import ImagePool
 from .base_model import BaseModel
 from . import networks
+import cv2
 
 
 class CycleGANModel(BaseModel):
@@ -41,6 +42,7 @@ class CycleGANModel(BaseModel):
             parser.add_argument('--lambda_A', type=float, default=10.0, help='weight for cycle loss (A -> B -> A)')
             parser.add_argument('--lambda_B', type=float, default=10.0, help='weight for cycle loss (B -> A -> B)')
             parser.add_argument('--lambda_identity', type=float, default=0.5, help='use identity mapping. Setting lambda_identity other than 0 has an effect of scaling the weight of the identity mapping loss. For example, if the weight of the identity loss should be 10 times smaller than the weight of the reconstruction loss, please set lambda_identity = 0.1')
+            parser.add_argument('--lambda_dice', type=float, default=5.0, help='weight for dice loss')
 
         return parser
 
@@ -52,7 +54,7 @@ class CycleGANModel(BaseModel):
         """
         BaseModel.__init__(self, opt)
         # specify the training losses you want to print out. The training/test scripts will call <BaseModel.get_current_losses>
-        self.loss_names = ['D_A', 'G_A', 'cycle_A', 'idt_A', 'D_B', 'G_B', 'cycle_B', 'idt_B']
+        self.loss_names = ['D_A', 'G_A', 'cycle_A', 'idt_A', 'D_B', 'G_B', 'cycle_B', 'idt_B', 'dice_A', 'dice_B'] # modified to add dice loss
         # specify the images you want to save/display. The training/test scripts will call <BaseModel.get_current_visuals>
         visual_names_A = ['real_A', 'fake_B', 'rec_A']
         visual_names_B = ['real_B', 'fake_A', 'rec_B']
@@ -153,6 +155,7 @@ class CycleGANModel(BaseModel):
         lambda_idt = self.opt.lambda_identity
         lambda_A = self.opt.lambda_A
         lambda_B = self.opt.lambda_B
+        lambda_dice = self.opt.lambda_dice
         # Identity loss
         if lambda_idt > 0:
             # G_A should be identity if real_B is fed: ||G_A(B) - B||
@@ -173,8 +176,16 @@ class CycleGANModel(BaseModel):
         self.loss_cycle_A = self.criterionCycle(self.rec_A, self.real_A) * lambda_A
         # Backward cycle loss || G_A(G_B(B)) - B||
         self.loss_cycle_B = self.criterionCycle(self.rec_B, self.real_B) * lambda_B
+
+        # Dice losses
+        self.loss_dice_A = weighted_dice_loss(self.fake_B, self.real_B) * lambda_dice
+        self.loss_dice_B = weighted_dice_loss(self.fake_A, self.real_A) * lambda_dice
+
         # combined loss and calculate gradients
-        self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B
+        self.loss_G = (self.loss_G_A + self.loss_G_B + 
+                self.loss_cycle_A + self.loss_cycle_B + 
+                self.loss_idt_A + self.loss_idt_B +
+                self.loss_dice_A + self.loss_dice_B)
         self.loss_G.backward()
 
     def optimize_parameters(self):
@@ -192,3 +203,107 @@ class CycleGANModel(BaseModel):
         self.backward_D_A()      # calculate gradients for D_A
         self.backward_D_B()      # calculate graidents for D_B
         self.optimizer_D.step()  # update D_A and D_B's weights
+
+@staticmethod
+def weighted_dice_loss(pred_map, target_map):
+    """
+    Compute weighted Dice loss between generated and ground truth maps
+    """
+    # Class weights
+    weights = {
+        'roads': 2.0,      
+        'buildings': 2.0,  
+        'water': 1.5,      
+        'vegetation': 1.0, 
+        'other': 0.5      
+    }
+    class_weights = torch.tensor(list(weights.values())).to(pred_map.device)
+    
+    # Get segmentation masks
+    pred_seg = color_segment(pred_map)    
+    target_seg = color_segment(target_map)
+    
+    # Compute weighted Dice loss for each class
+    intersection = (pred_seg * target_seg).sum(dim=(2, 3))
+    union = pred_seg.sum(dim=(2, 3)) + target_seg.sum(dim=(2, 3))
+    dice_per_class = (2. * intersection + 1.0) / (union + 1.0)
+    
+    # Apply weights and average
+    weighted_dice = dice_per_class * class_weights
+    return 1 - weighted_dice.mean()
+
+def color_segment(img):
+    """
+    Convert image to segmentation masks
+    Returns a tensor where each channel is a binary mask for one class
+    """
+    # Convert BGR to RGB if needed
+    if len(img.shape) == 4:  # If batch of images
+        image = img
+    else:  # Single image
+        image = img[None]
+    
+    # Convert to numpy and scale to 0-255 if needed
+    image_np = image.permute(0, 2, 3, 1).numpy()
+    if image_np.max() <= 1.0:
+        image_np = (image_np * 255).astype(np.uint8)
+    
+    # Define target colors in RGB
+    colors = {
+        'building': np.array([236, 239, 232]),  # #ecefe8
+        'road': np.array([252, 252, 252]),      # #fcfcfc
+        'main_road': np.array([249, 159, 39]),  # #f99f27
+        'sm_road': np.array([247, 244, 239]),   # #f7f4ef
+        'med_road': np.array([253, 223, 153]),  # #f7f4ef
+        'vegetation': np.array([203, 223, 174]), # #cbdfae
+        'water': np.array([156, 188, 245])      # #9cbcf5
+    }
+
+    # Define tolerances
+    tolerances = {
+        'building': 7,
+        'road': 15,
+        'main_road': 50,
+        'sm_road': 7,
+        'med_road': 5,
+        'vegetation': 15,
+        'water': 45
+    }
+
+    # Initialize output tensor (B, num_classes, H, W)
+    B, H, W, C = image_np.shape
+    masks = np.zeros((B, 4, H, W))  # 4 classes: roads, vegetation, water, buildings
+
+    for b in range(B):
+        # Create masks for each feature
+        building_matrix = np.abs(image_np[b] - colors['building']) <= tolerances['building']
+        road_matrix = np.add(
+            np.add(
+                np.add(
+                    np.abs(image_np[b] - colors['road']) <= tolerances['road'],
+                    np.abs(image_np[b] - colors['main_road']) <= tolerances['main_road']
+                ),
+                np.abs(image_np[b] - colors['sm_road']) <= tolerances['sm_road']
+            ),
+            np.abs(image_np[b] - colors['med_road']) <= tolerances['med_road']
+        )
+        
+        # Generate individual masks
+        building_mask = np.all(building_matrix, axis=2)
+        road_mask = np.all(np.logical_and(road_matrix, np.logical_not(building_matrix)), axis=2)
+        vegetation_mask = np.all(np.abs(image_np[b] - colors['vegetation']) <= tolerances['vegetation'], axis=2)
+        water_mask = np.all(np.abs(image_np[b] - colors['water']) <= tolerances['water'], axis=2)
+
+        # Apply denoising
+        building_mask = cv2.medianBlur(building_mask.astype(np.uint8), 5).astype(bool)
+        road_mask = cv2.medianBlur(road_mask.astype(np.uint8), 5).astype(bool)
+        vegetation_mask = cv2.medianBlur(vegetation_mask.astype(np.uint8), 5).astype(bool)
+        water_mask = cv2.medianBlur(water_mask.astype(np.uint8), 3).astype(bool)
+
+        # Stack masks in output tensor
+        masks[b, 0] = road_mask
+        masks[b, 1] = vegetation_mask
+        masks[b, 2] = water_mask
+        masks[b, 3] = building_mask
+
+    return masks.astype(np.float32)
