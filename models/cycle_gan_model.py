@@ -209,7 +209,7 @@ def weighted_dice_loss(pred_map, target_map):
     """
     Compute weighted Dice loss between generated and ground truth maps
     """
-    # Class weights
+    # Class weights - move to GPU
     weights = {
         'roads': 2.0,      
         'buildings': 2.0,  
@@ -217,49 +217,40 @@ def weighted_dice_loss(pred_map, target_map):
         'vegetation': 1.0, 
         'other': 0.5      
     }
-    class_weights = torch.tensor(list(weights.values())).to(pred_map.device)
+    class_weights = torch.tensor(list(weights.values()), device=pred_map.device)
     
-    # Get segmentation masks
+    # Get segmentation masks - keep on GPU
     pred_seg = color_segment(pred_map)    
     target_seg = color_segment(target_map)
     
-    # Compute weighted Dice loss for each class
+    # Compute weighted Dice loss for each class - all operations remain on GPU
     intersection = (pred_seg * target_seg).sum(dim=(2, 3))
     union = pred_seg.sum(dim=(2, 3)) + target_seg.sum(dim=(2, 3))
     dice_per_class = (2. * intersection + 1.0) / (union + 1.0)
     
-    # Apply weights and average
+    # Apply weights and average - still on GPU
     weighted_dice = dice_per_class * class_weights
     return 1 - weighted_dice.mean()
 
 def color_segment(img):
     """
-    Convert image to segmentation masks
-    Returns a tensor where each channel is a binary mask for one class
+    Convert image to segmentation masks - GPU version
     """
-    # Convert BGR to RGB if needed
-    if len(img.shape) == 4:  # If batch of images
-        image = img
-    else:  # Single image
-        image = img[None]
+    # Ensure input is in correct format
+    if len(img.shape) == 3:
+        img = img.unsqueeze(0)
     
-    # Convert to numpy and scale to 0-255 if needed
-    image_np = image.permute(0, 2, 3, 1).numpy()
-    if image_np.max() <= 1.0:
-        image_np = (image_np * 255).astype(np.uint8)
-    
-    # Define target colors in RGB
+    # Define colors as GPU tensors
     colors = {
-        'building': np.array([236, 239, 232]),  # #ecefe8
-        'road': np.array([252, 252, 252]),      # #fcfcfc
-        'main_road': np.array([249, 159, 39]),  # #f99f27
-        'sm_road': np.array([247, 244, 239]),   # #f7f4ef
-        'med_road': np.array([253, 223, 153]),  # #f7f4ef
-        'vegetation': np.array([203, 223, 174]), # #cbdfae
-        'water': np.array([156, 188, 245])      # #9cbcf5
+        'building': torch.tensor([236, 239, 232], device=img.device).float(),
+        'road': torch.tensor([252, 252, 252], device=img.device).float(),
+        'main_road': torch.tensor([249, 159, 39], device=img.device).float(),
+        'sm_road': torch.tensor([247, 244, 239], device=img.device).float(),
+        'med_road': torch.tensor([253, 223, 153], device=img.device).float(),
+        'vegetation': torch.tensor([203, 223, 174], device=img.device).float(),
+        'water': torch.tensor([156, 188, 245], device=img.device).float()
     }
 
-    # Define tolerances
     tolerances = {
         'building': 7,
         'road': 15,
@@ -270,40 +261,42 @@ def color_segment(img):
         'water': 45
     }
 
-    # Initialize output tensor (B, num_classes, H, W)
-    B, H, W, C = image_np.shape
-    masks = np.zeros((B, 4, H, W))  # 4 classes: roads, vegetation, water, buildings
+    # Scale image to 0-255 if needed
+    if img.max() <= 1.0:
+        img = img * 255.0
 
+    B, C, H, W = img.shape
+    masks = torch.zeros((B, 4, H, W), device=img.device)
+    
+    # Reshape image for easier color comparison
+    img_reshaped = img.permute(0, 2, 3, 1)  # B, H, W, C
+
+    # Create masks using GPU operations
     for b in range(B):
-        # Create masks for each feature
-        building_matrix = np.abs(image_np[b] - colors['building']) <= tolerances['building']
-        road_matrix = np.add(
-            np.add(
-                np.add(
-                    np.abs(image_np[b] - colors['road']) <= tolerances['road'],
-                    np.abs(image_np[b] - colors['main_road']) <= tolerances['main_road']
-                ),
-                np.abs(image_np[b] - colors['sm_road']) <= tolerances['sm_road']
-            ),
-            np.abs(image_np[b] - colors['med_road']) <= tolerances['med_road']
-        )
-        
-        # Generate individual masks
-        building_mask = np.all(building_matrix, axis=2)
-        road_mask = np.all(np.logical_and(road_matrix, np.logical_not(building_matrix)), axis=2)
-        vegetation_mask = np.all(np.abs(image_np[b] - colors['vegetation']) <= tolerances['vegetation'], axis=2)
-        water_mask = np.all(np.abs(image_np[b] - colors['water']) <= tolerances['water'], axis=2)
+        # Building mask
+        building_matrix = torch.abs(img_reshaped[b].unsqueeze(-2) - colors['building']) <= tolerances['building']
+        building_mask = torch.all(building_matrix, dim=-1)
 
-        # Apply denoising
-        building_mask = cv2.medianBlur(building_mask.astype(np.uint8), 5).astype(bool)
-        road_mask = cv2.medianBlur(road_mask.astype(np.uint8), 5).astype(bool)
-        vegetation_mask = cv2.medianBlur(vegetation_mask.astype(np.uint8), 5).astype(bool)
-        water_mask = cv2.medianBlur(water_mask.astype(np.uint8), 3).astype(bool)
+        # Road mask (combined)
+        road_conditions = [
+            torch.abs(img_reshaped[b].unsqueeze(-2) - colors[road_type]) <= tolerances[road_type]
+            for road_type in ['road', 'main_road', 'sm_road', 'med_road']
+        ]
+        road_matrix = torch.any(torch.stack([torch.all(cond, dim=-1) for cond in road_conditions]), dim=0)
+        road_mask = road_matrix & ~building_mask
 
-        # Stack masks in output tensor
-        masks[b, 0] = road_mask
-        masks[b, 1] = vegetation_mask
-        masks[b, 2] = water_mask
-        masks[b, 3] = building_mask
+        # Vegetation mask
+        vegetation_matrix = torch.abs(img_reshaped[b].unsqueeze(-2) - colors['vegetation']) <= tolerances['vegetation']
+        vegetation_mask = torch.all(vegetation_matrix, dim=-1)
 
-    return masks.astype(np.float32)
+        # Water mask
+        water_matrix = torch.abs(img_reshaped[b].unsqueeze(-2) - colors['water']) <= tolerances['water']
+        water_mask = torch.all(water_matrix, dim=-1)
+
+        # Stack masks
+        masks[b, 0] = road_mask.float()
+        masks[b, 1] = vegetation_mask.float()
+        masks[b, 2] = water_mask.float()
+        masks[b, 3] = building_mask.float()
+
+    return masks
