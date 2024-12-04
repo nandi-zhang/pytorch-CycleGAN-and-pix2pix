@@ -232,71 +232,59 @@ def weighted_dice_loss(pred_map, target_map):
     weighted_dice = dice_per_class * class_weights
     return 1 - weighted_dice.mean()
 
-def color_segment(img):
+def color_segment(input_image):
     """
-    Convert image to segmentation masks - GPU version
+    Segment the input image into different classes based on color thresholds
+    Args:
+        input_image: Input tensor of shape [B, C, H, W]
+    Returns:
+        masks: Binary masks for each class [B, num_classes, H, W]
     """
-    # Ensure input is in correct format
-    if len(img.shape) == 3:
-        img = img.unsqueeze(0)
+    # Move input to CPU for numpy operations if needed
+    if input_image.is_cuda:
+        image = input_image.cpu()
+    else:
+        image = input_image
+        
+    # Get dimensions
+    batch_size, channels, height, width = image.size()
     
-    # Define colors as GPU tensors
-    colors = {
-        'building': torch.tensor([236, 239, 232], device=img.device).float(),
-        'road': torch.tensor([252, 252, 252], device=img.device).float(),
-        'main_road': torch.tensor([249, 159, 39], device=img.device).float(),
-        'sm_road': torch.tensor([247, 244, 239], device=img.device).float(),
-        'med_road': torch.tensor([253, 223, 153], device=img.device).float(),
-        'vegetation': torch.tensor([203, 223, 174], device=img.device).float(),
-        'water': torch.tensor([156, 188, 245], device=img.device).float()
-    }
-
-    tolerances = {
-        'building': 7,
-        'road': 15,
-        'main_road': 50,
-        'sm_road': 7,
-        'med_road': 5,
-        'vegetation': 15,
-        'water': 45
-    }
-
-    # Scale image to 0-255 if needed
-    if img.max() <= 1.0:
-        img = img * 255.0
-
-    B, C, H, W = img.shape
-    masks = torch.zeros((B, 4, H, W), device=img.device)
+    # Initialize output masks tensor
+    num_classes = 4  # Adjust based on your classes (road, building, vegetation, other)
+    masks = torch.zeros(batch_size, num_classes, height, width)
     
-    # Reshape image for easier color comparison
-    img_reshaped = img.permute(0, 2, 3, 1)  # B, H, W, C
-
-    # Create masks using GPU operations
-    for b in range(B):
-        # Building mask
-        building_matrix = torch.abs(img_reshaped[b].unsqueeze(-2) - colors['building']) <= tolerances['building']
-        building_mask = torch.all(building_matrix, dim=-1)
-
-        # Road mask (combined)
-        road_conditions = [
-            torch.abs(img_reshaped[b].unsqueeze(-2) - colors[road_type]) <= tolerances[road_type]
-            for road_type in ['road', 'main_road', 'sm_road', 'med_road']
-        ]
-        road_matrix = torch.any(torch.stack([torch.all(cond, dim=-1) for cond in road_conditions]), dim=0)
-        road_mask = road_matrix & ~building_mask
-
-        # Vegetation mask
-        vegetation_matrix = torch.abs(img_reshaped[b].unsqueeze(-2) - colors['vegetation']) <= tolerances['vegetation']
-        vegetation_mask = torch.all(vegetation_matrix, dim=-1)
-
-        # Water mask
-        water_matrix = torch.abs(img_reshaped[b].unsqueeze(-2) - colors['water']) <= tolerances['water']
-        water_mask = torch.all(water_matrix, dim=-1)
-
-        # Stack masks
+    # Process each image in batch
+    for b in range(batch_size):
+        # Convert to format [H, W, C] for easier processing
+        img = image[b].permute(1, 2, 0)
+        
+        # Create masks for each class based on color thresholds
+        # Road (gray)
+        road_mask = ((img[:,:,0] > 0.4) & (img[:,:,0] < 0.6) &
+                    (img[:,:,1] > 0.4) & (img[:,:,1] < 0.6) &
+                    (img[:,:,2] > 0.4) & (img[:,:,2] < 0.6))
+        
+        # Building (red)
+        building_mask = ((img[:,:,0] > 0.6) &
+                        (img[:,:,1] < 0.4) &
+                        (img[:,:,2] < 0.4))
+        
+        # Vegetation (green)
+        vegetation_mask = ((img[:,:,0] < 0.4) &
+                         (img[:,:,1] > 0.6) &
+                         (img[:,:,2] < 0.4))
+        
+        # Other (everything else)
+        other_mask = ~(road_mask | building_mask | vegetation_mask)
+        
+        # Assign masks to output tensor
         masks[b, 0] = road_mask.float()
-        masks[b, 1] = vegetation_mask.float()
-        masks[b, 2] = water_mask.float()
-        masks[b, 3] = building_mask.float()
-
+        masks[b, 1] = building_mask.float()
+        masks[b, 2] = vegetation_mask.float()
+        masks[b, 3] = other_mask.float()
+    
+    # Move back to original device
+    if input_image.is_cuda:
+        masks = masks.cuda()
+    
     return masks
