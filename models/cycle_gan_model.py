@@ -236,10 +236,7 @@ def color_segment(input_image):
     """
     Segment the input image into different classes based on color thresholds
     """
-    if input_image.is_cuda:
-        image = input_image.cpu()
-    else:
-        image = input_image
+    image = input_image
         
     batch_size, channels, height, width = image.size()
     
@@ -278,8 +275,5 @@ def color_segment(input_image):
         masks[b, 2] = water_mask.float()
         masks[b, 3] = vegetation_mask.float()
         masks[b, 4] = other_mask.float()
-    
-    if input_image.is_cuda:
-        masks = masks.cuda()
     
     return masks
