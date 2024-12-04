@@ -235,30 +235,21 @@ def weighted_dice_loss(pred_map, target_map):
 def color_segment(input_image):
     """
     Segment the input image into different classes based on color thresholds
-    Args:
-        input_image: Input tensor of shape [B, C, H, W]
-    Returns:
-        masks: Binary masks for each class [B, num_classes, H, W]
     """
-    # Move input to CPU for numpy operations if needed
     if input_image.is_cuda:
         image = input_image.cpu()
     else:
         image = input_image
         
-    # Get dimensions
     batch_size, channels, height, width = image.size()
     
-    # Initialize output masks tensor
-    num_classes = 4  # Adjust based on your classes (road, building, vegetation, other)
+    # Change to 5 classes
+    num_classes = 5  # roads, buildings, water, vegetation, other
     masks = torch.zeros(batch_size, num_classes, height, width)
     
-    # Process each image in batch
     for b in range(batch_size):
-        # Convert to format [H, W, C] for easier processing
         img = image[b].permute(1, 2, 0)
         
-        # Create masks for each class based on color thresholds
         # Road (gray)
         road_mask = ((img[:,:,0] > 0.4) & (img[:,:,0] < 0.6) &
                     (img[:,:,1] > 0.4) & (img[:,:,1] < 0.6) &
@@ -269,21 +260,25 @@ def color_segment(input_image):
                         (img[:,:,1] < 0.4) &
                         (img[:,:,2] < 0.4))
         
+        # Water (blue)
+        water_mask = ((img[:,:,0] < 0.4) &
+                     (img[:,:,1] < 0.4) &
+                     (img[:,:,2] > 0.6))
+        
         # Vegetation (green)
         vegetation_mask = ((img[:,:,0] < 0.4) &
                          (img[:,:,1] > 0.6) &
                          (img[:,:,2] < 0.4))
         
         # Other (everything else)
-        other_mask = ~(road_mask | building_mask | vegetation_mask)
+        other_mask = ~(road_mask | building_mask | water_mask | vegetation_mask)
         
-        # Assign masks to output tensor
         masks[b, 0] = road_mask.float()
         masks[b, 1] = building_mask.float()
-        masks[b, 2] = vegetation_mask.float()
-        masks[b, 3] = other_mask.float()
+        masks[b, 2] = water_mask.float()
+        masks[b, 3] = vegetation_mask.float()
+        masks[b, 4] = other_mask.float()
     
-    # Move back to original device
     if input_image.is_cuda:
         masks = masks.cuda()
     
