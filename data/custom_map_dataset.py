@@ -1,33 +1,42 @@
 import os
+import subprocess
+import zipfile
+import numpy as np
+import kagglehub
+import cv2
+import torch
+from PIL import Image
 from data.base_dataset import BaseDataset, get_transform
 from data.image_folder import make_dataset
-from PIL import Image
-import numpy as np
-import torch
-import torchvision.transforms as transforms
-import cv2
 
+def download_dataset():
+    """Download the dataset using kagglehub."""
+    
+    # Download latest version of the dataset
+    path = kagglehub.dataset_download("alincijov/pix2pix-maps")
+    print("Dataset downloaded to:", path)
+    return path
+
+# Usage in your dataset class
 class CustomMapDataset(BaseDataset):
-    """Dataset class that loads satellite-map image pairs and handles segmentation masks.
-    """
-    @staticmethod
-    def modify_commandline_options(parser, is_train):
-        """Add new dataset-specific options and rewrite default values.
-
-        Parameters:
-            parser          -- original option parser
-            is_train (bool) -- whether training phase or test phase.
-
-        Returns:
-            the modified parser.
-        """
-        parser.set_defaults(input_nc=3, output_nc=3, direction='AtoB')  # 3 channels for RGB
-        return parser
-
     def __init__(self, opt):
         BaseDataset.__init__(self, opt)
-        self.dir = os.path.join(opt.dataroot, opt.phase)
+        self.dataset_path = download_dataset()
+        self.dir = os.path.join(self.dataset_path, opt.phase)
+        
+        # If phase directory doesn't exist, use root directory
+        if not os.path.exists(self.dir):
+            print(f"Phase directory {opt.phase} not found, using root directory")
+            self.dir = self.dataset_path
+            
+        print(f"Loading images from: {self.dir}")
         self.AB_paths = sorted(make_dataset(self.dir, opt.max_dataset_size))
+        
+        if len(self.AB_paths) == 0:
+            raise RuntimeError(f"Found 0 images in: {self.dir}\nPlease check the data directory.")
+        else:
+            print(f"Found {len(self.AB_paths)} images")
+        
         self.direction = opt.direction
         
         # Define colors for segmentation (RGB format)
@@ -46,14 +55,14 @@ class CustomMapDataset(BaseDataset):
             'road': 15,
             'main_road': 50,
             'sm_road': 7,
-            'med_road': 5,  # Add medium road tolerance
+            'med_road': 5,
             'vegetation': 15,
             'water': 45,
             'building': 7
         }
 
         # Make sure transforms don't include horizontal flips
-        opt.no_flip = True  # Force no flipping
+        opt.no_flip = True
         self.transform = get_transform(opt, convert=True)
 
     def __getitem__(self, index):
@@ -71,7 +80,7 @@ class CustomMapDataset(BaseDataset):
         B_np = np.array(B)
         seg_mask = self.color_segment(torch.from_numpy(B_np.transpose(2, 0, 1)).float() / 255.0)
         
-        # Apply transforms for model training
+        # Apply transforms
         A = self.transform(A)
         B_transformed = self.transform(B)
         
@@ -96,7 +105,7 @@ class CustomMapDataset(BaseDataset):
                 ),
                 np.abs(img_np - self.colors['sm_road']) <= self.tolerances['sm_road']
             ),
-            np.abs(img_np - self.colors['med_road']) <= self.tolerances['med_road']  # Fixed reference
+            np.abs(img_np - self.colors['med_road']) <= self.tolerances['med_road']
         )
         
         # Generate masks with building-road conflict resolution
@@ -122,5 +131,4 @@ class CustomMapDataset(BaseDataset):
         return torch.FloatTensor(mask.transpose(2, 0, 1))
 
     def __len__(self):
-        """Return the total number of images in the dataset."""
         return len(self.AB_paths)
