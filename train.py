@@ -19,9 +19,11 @@ See training and test tips at: https://github.com/junyanz/pytorch-CycleGAN-and-p
 See frequently asked questions at: https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix/blob/master/docs/qa.md
 """
 import time
+import torch
 from options.train_options import TrainOptions
 from data import create_dataset
 from models import create_model
+from collections import OrderedDict
 from util.visualizer import Visualizer
 
 if __name__ == '__main__':
@@ -30,8 +32,23 @@ if __name__ == '__main__':
     dataset_size = len(dataset)    # get the number of images in the dataset.
     print('The number of training images = %d' % dataset_size)
 
+    model_dict = torch.load("/content/pytorch-CycleGAN-and-pix2pix/checkpoints/sat2map_pretrained/latest_net_G.pth")
+    for key in list(model_dict.keys()):
+      if 'running_mean' in key or 'running_var' in key or 'num_batches_tracked' in key:
+          del model_dict[key]
+    new_dict = OrderedDict()
+    for k, v in model_dict.items():
+        # load_state_dict expects keys with prefix 'module.'
+        new_dict["module." + k] = v
+
     model = create_model(opt)      # create a model given opt.model and other options
     model.setup(opt)               # regular setup: load and print networks; create schedulers
+    msgA = model.netG_A.load_state_dict(new_dict, strict=False)  # For satellite → map
+    msgB = model.netG_B.load_state_dict(new_dict, strict=False)  # For map → satellite              # regular setup: load and print networks; create schedulers
+    model.netG_A = model.netG_A.to('cuda')
+    model.netG_B = model.netG_B.to('cuda')
+    print(msgA)
+    print(msgB)
     visualizer = Visualizer(opt)   # create a visualizer that display/save images and plots
     total_iters = 0                # the total number of training iterations
 

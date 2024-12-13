@@ -217,18 +217,19 @@ def weighted_dice_loss(pred_map, target_map):
         'vegetation': 1.0, 
         'other': 0.5      
     }
+    # Move weights to same device as input tensors
     class_weights = torch.tensor(list(weights.values()), device=pred_map.device)
     
-    # Get segmentation masks - keep on GPU
-    pred_seg = color_segment(pred_map)    
-    target_seg = color_segment(target_map)
+    # Get segmentation masks
+    pred_seg = color_segment(pred_map)    # Already on GPU from modified color_segment
+    target_seg = color_segment(target_map) # Already on GPU from modified color_segment
     
-    # Compute weighted Dice loss for each class - all operations remain on GPU
+    # Compute weighted Dice loss for each class
     intersection = (pred_seg * target_seg).sum(dim=(2, 3))
     union = pred_seg.sum(dim=(2, 3)) + target_seg.sum(dim=(2, 3))
     dice_per_class = (2. * intersection + 1.0) / (union + 1.0)
     
-    # Apply weights and average - still on GPU
+    # Apply weights and average
     weighted_dice = dice_per_class * class_weights
     return 1 - weighted_dice.mean()
 
@@ -236,33 +237,29 @@ def color_segment(input_image):
     """
     Segment the input image into different classes based on color thresholds
     """
-    image = input_image
-        
-    batch_size, channels, height, width = image.size()
+    batch_size, channels, height, width = input_image.size()
     
-    # Change to 5 classes
-    num_classes = 5  # roads, buildings, water, vegetation, other
-    masks = torch.zeros(batch_size, num_classes, height, width)
+    # Create masks tensor on same device as input
+    num_classes = 5
+    masks = torch.zeros(batch_size, num_classes, height, width, device=input_image.device)
     
     for b in range(batch_size):
-        img = image[b].permute(1, 2, 0)
+        # Keep on GPU, no need to move between devices
+        img = input_image[b].permute(1, 2, 0)
         
-        # Road (gray)
+        # All these operations will stay on GPU
         road_mask = ((img[:,:,0] > 0.4) & (img[:,:,0] < 0.6) &
                     (img[:,:,1] > 0.4) & (img[:,:,1] < 0.6) &
                     (img[:,:,2] > 0.4) & (img[:,:,2] < 0.6))
         
-        # Building (red)
         building_mask = ((img[:,:,0] > 0.6) &
                         (img[:,:,1] < 0.4) &
                         (img[:,:,2] < 0.4))
         
-        # Water (blue)
         water_mask = ((img[:,:,0] < 0.4) &
                      (img[:,:,1] < 0.4) &
                      (img[:,:,2] > 0.6))
         
-        # Vegetation (green)
         vegetation_mask = ((img[:,:,0] < 0.4) &
                          (img[:,:,1] > 0.6) &
                          (img[:,:,2] < 0.4))
@@ -270,6 +267,7 @@ def color_segment(input_image):
         # Other (everything else)
         other_mask = ~(road_mask | building_mask | water_mask | vegetation_mask)
         
+        # All masks are already on GPU, just assign them
         masks[b, 0] = road_mask.float()
         masks[b, 1] = building_mask.float()
         masks[b, 2] = water_mask.float()
